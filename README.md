@@ -32,6 +32,31 @@ This project estimates which economic regime the market is pricing in, from the 
 
    These changes are just for you, and they reset when you reload the page.
 10. **Download the data (optional).** Click **Download CSV** at the bottom for every date's votes, scores and Regime Winner. Open **All data** to browse it on the page.
+11. **Check the Warning signals tab.** Click **Warning signals** at the top of the page to see market indicators that may move before stocks do (details below).
+
+---
+
+## Warning signals tab
+
+The regime model reacts to price, so it trails the market by about a week. This tab tests indicators that are often said to move *first*. Each one is turned into a simple risk-off **warning (1)** or **all clear (0)**:
+
+| Signal | Calculation | Warning when |
+|---|---|---|
+| Contango | VIX / VIX3M | 5-day average above 1 (backwardation) |
+| Lumber vs gold | WOOD / GLD | Ratio lower than it was 65 trading days ago |
+| Credit | HYG / IEF | Ratio lower than it was 65 trading days ago |
+| Copper vs gold | CPER / GLD | Ratio lower than it was 65 trading days ago |
+| Small vs large caps | IWM / SPY | Ratio lower than it was 65 trading days ago |
+| Breadth | RSP / SPY | Ratio lower than it was 65 trading days ago |
+| Yield curve | 10-year yield − 3-month yield | Below 0 (inverted) |
+
+What the tab shows:
+- **Signals warning today:** how many signals flag risk-off right now, plus an overall read of Risk-on, Mixed or Risk-off.
+- **Signal scorecard:** each signal's latest value and status, whether it **leads or lags** QQQ, its correlation with the *next* 20 days, and QQQ's average next-20-day return after a warning compared with all other days. The regime model is included as a baseline.
+- **Combined warning score:** the number of signals warning each day, charted against QQQ, with a table of what QQQ did next at each score.
+- **Look at one signal:** a chart of any single signal with its warning days marked, plus its lead/lag profile.
+
+In the sidebar you can change the ratio lookback (65 days is about 13 weeks) and choose which signals to include. No indicator times the market reliably, so treat this tab as a way to test ideas, not as trading advice.
 
 ---
 

@@ -13,9 +13,14 @@ Put it online for free:      push this file + requirements.txt to GitHub, then d
 Prices come from Yahoo Finance and refresh every few hours (or with the Refresh button).
 """
 
+import base64
+import json
+import os
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -34,6 +39,28 @@ DEFAULT_START = "2018-10-12"
 REGIMES = list(DEFAULT_BUCKETS)        # order matters for ties (same as the IF chain in AJ)
 COLORS = {"Disinflation": "#2a7de1", "Reflation": "#2ca02c",
           "Stagflation": "#d62728", "Deflation": "#7f7f7f"}
+
+# Macro quad calendar from ETF_Bucketing.xlsm: "month the quad starts:quad", in order.
+# Used by the Add tickers tab to rank a stock the same way getETF does.
+QUAD_RUNS = (
+    "2005-01:4;2005-02:3;2005-05:4;2005-06:1;2005-07:2;2005-08:3;2005-10:1;2006-01:2;2006-02:"
+    "4;2006-04:3;2006-07:4;2006-08:1;2006-11:2;2007-01:1;2007-02:3;2007-04:1;2007-05:2;2007-0"
+    "6:1;2007-07:4;2007-09:3;2007-12:4;2008-01:3;2008-02:4;2008-05:3;2008-08:4;2009-02:3;2009"
+    "-03:1;2009-08:2;2010-01:1;2010-03:2;2010-04:4;2010-07:3;2010-08:4;2010-09:1;2010-10:2;20"
+    "10-11:1;2010-12:2;2011-03:3;2011-10:1;2012-04:4;2012-08:2;2012-11:4;2013-01:1;2013-02:2;"
+    "2013-03:1;2013-05:2;2013-08:1;2013-09:4;2013-11:2;2014-01:3;2014-02:1;2014-03:2;2014-06:"
+    "1;2015-01:4;2015-02:3;2015-04:4;2015-05:3;2015-09:4;2015-10:3;2016-01:2;2016-02:1;2016-0"
+    "3:2;2016-05:1;2016-06:2;2016-07:4;2016-08:3;2016-09:2;2016-11:1;2016-12:2;2017-03:4;2017"
+    "-06:1;2017-07:2;2017-10:1;2017-11:2;2017-12:1;2018-02:2;2018-04:3;2018-06:2;2018-07:3;20"
+    "18-08:1;2018-09:4;2018-10:3;2018-11:4;2019-03:3;2019-05:4;2019-07:3;2019-08:4;2019-10:2;"
+    "2020-02:4;2020-05:1;2020-06:2;2020-10:1;2020-12:2;2021-05:3;2021-07:4;2021-09:3;2022-04:"
+    "4;2022-05:3;2022-07:4;2023-01:1;2023-02:4;2023-05:1;2023-07:2;2023-09:4;2023-12:2;2024-0"
+    "1:1;2024-02:2;2024-04:4;2024-09:1;2024-10:2;2025-02:4;2025-05:3;2025-06:2;2025-09:3;2025"
+    "-10:4;2026-01:1;2026-02:2;2026-03:4;2026-04:1;2026-05:2;2026-07:1;2026-08:2;2026-11:1;20"
+    "27-01:2"
+)
+QUAD_START = "2005-01-03"
+DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets.json")
 
 # Indicator windows (same as the spreadsheet)
 HV_DAYS = 5                    # D: HV-5
@@ -204,10 +231,138 @@ def forward_returns(flag, asset, days=20):
 
 
 # ----------------------------------------------------------------------------------
+# Adding tickers: getETF-style ranking, saved buckets
+# ----------------------------------------------------------------------------------
+def parse_tickers(text):
+    """'tsla, panw  meta' -> ['TSLA', 'PANW', 'META'] (commas or spaces, no repeats)."""
+    out = []
+    for t in text.replace(",", " ").split():
+        t = t.strip().upper()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def load_defaults():
+    """Default buckets: buckets.json in the repo if it exists, otherwise the ones in this file."""
+    try:
+        with open(DEFAULTS_FILE) as f:
+            cfg = json.load(f)
+        buckets = {r: [str(t).upper() for t in cfg["buckets"][r]] for r in REGIMES}
+        outside = [str(t).upper() for t in cfg.get("outside", DEFAULT_OUTSIDE)]
+        return buckets, outside
+    except Exception:
+        return DEFAULT_BUCKETS, DEFAULT_OUTSIDE
+
+
+def quad_for_dates(index):
+    """Macro quad (1-4) for each date, from the ETF_Bucketing calendar."""
+    runs = [s.split(":") for s in QUAD_RUNS.split(";")]
+    starts = np.array([m for m, _ in runs])
+    quads = np.array([int(q) for _, q in runs])
+    months = np.array(pd.DatetimeIndex(index).strftime("%Y-%m"))
+    pos = np.searchsorted(starts, months, side="right") - 1
+    return pd.Series(np.where(pos >= 0, quads[pos.clip(0)], 0), index=index)
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner="Ranking tickers by quad (getETF method)...")
+def rank_tickers(tickers):
+    """Average daily return in each macro quad since 2005 (or the listing date), like the
+    getETF / PerformanceRank macro. Returns one row per ticker."""
+    data = yf.download(list(tickers), start=QUAD_START, auto_adjust=False, progress=False)
+    close = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Close"]]
+    if not isinstance(data.columns, pd.MultiIndex):
+        close.columns = list(tickers)[:1]
+    rows = []
+    for t in tickers:
+        s = close[t].dropna() if t in close else pd.Series(dtype=float)
+        if len(s) < 30:
+            rows.append({"Ticker": t, "Best quad": None, "Note": "No data from Yahoo"})
+            continue
+        ret = s.pct_change().dropna()
+        quad = quad_for_dates(ret.index)
+        avg = ret.groupby(quad).mean()
+        avg = {q: avg.get(q, np.nan) for q in (1, 2, 3, 4)}
+        order = sorted((q for q in avg if pd.notna(avg[q])), key=lambda q: -avg[q])
+        first = s.index[0]
+        note = "" if first <= pd.Timestamp(DEFAULT_START) else \
+            f"Listed after {pd.Timestamp(DEFAULT_START):%b %d, %Y}: shorter history"
+        rows.append({
+            "Ticker": t, "Best quad": order[0] if order else None,
+            "Bucket": REGIMES[order[0] - 1] if order else None,
+            "getETF rank order": "-".join(f"Q{q}" for q in order),
+            **{f"Q{q} avg daily %": round(avg[q] * 100, 3) if pd.notna(avg[q]) else None
+               for q in (1, 2, 3, 4)},
+            "Data since": f"{first:%Y-%m-%d}", "Note": note,
+        })
+    df = pd.DataFrame(rows)
+    df["Best quad"] = df["Best quad"].astype("Int64")
+    return df
+
+
+def add_to_buckets(assignments):
+    """Button callback: put each ticker in its bucket (and take it out of any other)."""
+    for ticker, regime in assignments.items():
+        for r in REGIMES:
+            key = f"bucket_{r}"
+            names = [t for t in parse_tickers(st.session_state[key]) if t != ticker]
+            if r == regime:
+                names.append(ticker)
+            st.session_state[key] = ", ".join(names)
+
+
+def save_defaults_to_github(buckets, outside):
+    """Commit buckets.json to the GitHub repo so the new buckets become everyone's default.
+    Needs GITHUB_TOKEN (and optionally GITHUB_REPO) in the app's Streamlit secrets."""
+    token = st.secrets["GITHUB_TOKEN"]
+    repo = st.secrets.get("GITHUB_REPO", "joseguardianez/regime-model")
+    url = f"https://api.github.com/repos/{repo}/contents/buckets.json"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    current = requests.get(url, headers=headers, timeout=20)
+    body = {
+        "message": "Update default buckets from the website",
+        "content": base64.b64encode(json.dumps({"buckets": buckets, "outside": outside},
+                                               indent=2).encode()).decode(),
+    }
+    if current.status_code == 200:
+        body["sha"] = current.json()["sha"]
+    result = requests.put(url, headers=headers, json=body, timeout=20)
+    return result.status_code in (200, 201), result.status_code
+
+
+def secret(name):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return None
+
+
+def reset_buckets():
+    """Button callback: forget edits and go back to the default buckets."""
+    for r in REGIMES:
+        st.session_state.pop(f"bucket_{r}", None)
+    st.session_state.pop("outside_text", None)
+    st.session_state.pop("buckets_ready", None)
+    st.query_params.clear()
+
+
+# ----------------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------------
 st.set_page_config(page_title="Bottoms-Up Regime Segmentation", layout="wide")
 st.title("Bottoms-Up Regime Segmentation")
+
+# Buckets come from the page link (?q1=...&q2=...) if it has them, otherwise the defaults.
+# That way changes stick when you reload, and you can bookmark or share the link.
+default_buckets, default_outside = load_defaults()
+if "buckets_ready" not in st.session_state:
+    qp = st.query_params
+    for i, r in enumerate(REGIMES):
+        st.session_state[f"bucket_{r}"] = ", ".join(
+            parse_tickers(qp.get(f"q{i + 1}", "")) or default_buckets[r])
+    st.session_state["outside_text"] = ", ".join(
+        parse_tickers(qp.get("out", "")) or default_outside)
+    st.session_state["buckets_ready"] = True
 
 with st.sidebar:
     st.header("Settings")
@@ -217,10 +372,11 @@ with st.sidebar:
     st.subheader("Buckets")
     buckets = {}
     for r in REGIMES:
-        text = st.text_input(r, ", ".join(DEFAULT_BUCKETS[r]))
-        buckets[r] = [t.strip().upper() for t in text.split(",") if t.strip()]
-    outside_text = st.text_input("Outside assets", ", ".join(DEFAULT_OUTSIDE))
-    outside_assets = [t.strip().upper() for t in outside_text.split(",") if t.strip()]
+        st.text_input(r, key=f"bucket_{r}")
+        buckets[r] = parse_tickers(st.session_state[f"bucket_{r}"])
+    st.text_input("Outside assets", key="outside_text")
+    outside_assets = parse_tickers(st.session_state["outside_text"])
+    st.button("Reset buckets to defaults", on_click=reset_buckets)
     st.subheader("Warning signals")
     lookback = st.slider("Ratio lookback (days)", 20, 130, 65,
                          help="A ratio signal warns when the ratio is lower than it was this many "
@@ -228,6 +384,17 @@ with st.sidebar:
     chosen = st.multiselect("Signals to include", list(SIGNALS), default=list(SIGNALS))
     if st.button("Refresh data"):
         st.cache_data.clear()
+
+# Keep the page link in step with the buckets, so a reload or bookmark keeps them
+user_buckets = {r: list(buckets[r]) for r in REGIMES}
+user_outside = list(outside_assets)
+link_params = {f"q{i + 1}": ",".join(buckets[r]) for i, r in enumerate(REGIMES)}
+link_params["out"] = ",".join(outside_assets)
+if all(buckets[r] == default_buckets[r] for r in REGIMES) and outside_assets == default_outside:
+    if len(st.query_params):
+        st.query_params.clear()
+elif {k: st.query_params.get(k) for k in link_params} != link_params:
+    st.query_params.from_dict(link_params)
 
 stocks = sorted({t for names in buckets.values() for t in names})
 if any(len(buckets[r]) == 0 for r in REGIMES):
@@ -254,7 +421,7 @@ votes, raw, score, winner_num = build_regimes(prices, vix.reindex(prices.index),
 last = winner_num.last_valid_index()
 st.caption(f"Data through {last.date()} · Yahoo Finance · refreshes every 6 hours")
 
-tab_model, tab_signals = st.tabs(["Regime model", "Warning signals"])
+tab_model, tab_signals, tab_add = st.tabs(["Regime model", "Warning signals", "Add tickers"])
 
 # ==================================================================================
 # Tab 1: the regime model
@@ -333,6 +500,60 @@ with tab_model:
         st.dataframe(table.dropna(subset=["Regime Winner"]).iloc[::-1], width="stretch")
     st.download_button("Download CSV", table.to_csv(index_label="Date"), "regime_output.csv",
                        "text/csv")
+
+# ==================================================================================
+# Tab 3: add tickers (written before tab 2's code so tab 2 can stop early safely)
+# ==================================================================================
+with tab_add:
+    st.markdown(
+        "Type ticker symbols and the site ranks each one with the **getETF method** from "
+        "ETF_Bucketing.xlsm: its average daily return in each macro quad since 2005 (or since it "
+        "started trading). The stock belongs in the bucket where it ranks first.")
+    add_text = st.text_area("Tickers (separate with commas or spaces, up to 100)",
+                            key="add_text", placeholder="e.g. NVDA, KO, NEM, ULTA")
+    if st.button("Rank tickers", type="primary"):
+        wanted = parse_tickers(add_text)[:100]
+        if wanted:
+            st.session_state["ranked"] = rank_tickers(tuple(wanted))
+        else:
+            st.warning("Type at least one ticker first.")
+    ranked = st.session_state.get("ranked")
+    if ranked is not None and len(ranked):
+        st.dataframe(ranked, hide_index=True, width="stretch")
+        valid = ranked.dropna(subset=["Best quad"]).set_index("Ticker")
+        if len(valid):
+            pick_add = st.multiselect("Add these to their best bucket", list(valid.index),
+                                      default=list(valid.index), key="pick_add")
+            st.button(f"Add {len(pick_add)} ticker(s) to the model", type="primary",
+                      on_click=add_to_buckets, args=({t: valid.loc[t, "Bucket"] for t in pick_add},),
+                      disabled=not pick_add)
+
+    st.divider()
+    st.subheader("Current buckets")
+    longest = max(len(v) for v in user_buckets.values())
+    st.dataframe(pd.DataFrame({r: user_buckets[r] + [""] * (longest - len(user_buckets[r]))
+                               for r in REGIMES}), hide_index=True, width="stretch")
+    st.caption("Your changes are saved in this page's link, so they stay when you reload. "
+               "Bookmark or share the link to keep them. To remove a ticker, delete it from its "
+               "box in the sidebar. **Reset buckets to defaults** in the sidebar undoes everything.")
+
+    st.subheader("Save as the default for everyone")
+    if secret("GITHUB_TOKEN") and secret("ADMIN_PASSWORD"):
+        password = st.text_input("Admin password", type="password", key="admin_pw")
+        if st.button("Save these buckets as the default"):
+            if password == secret("ADMIN_PASSWORD"):
+                ok, code = save_defaults_to_github(user_buckets, user_outside)
+                if ok:
+                    st.success("Saved to GitHub. The site restarts with the new defaults in "
+                               "about a minute.")
+                else:
+                    st.error(f"GitHub refused the save (error {code}). Check the token.")
+            else:
+                st.error("Wrong password.")
+    else:
+        st.info("Not set up yet. To let this page change the defaults for everyone, add a "
+                "GITHUB_TOKEN and an ADMIN_PASSWORD to the app's secrets (see "
+                "'Saving default buckets' in the README).")
 
 # ==================================================================================
 # Tab 2: warning signals

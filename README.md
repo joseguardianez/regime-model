@@ -33,6 +33,30 @@ This project estimates which economic regime the market is pricing in, from the 
    These changes are just for you, and they reset when you reload the page.
 10. **Download the data (optional).** Click **Download CSV** at the bottom for every date's votes, scores and Regime Winner. Open **All data** to browse it on the page.
 11. **Check the Warning signals tab.** Click **Warning signals** at the top of the page to see market indicators that may move before stocks do (details below).
+12. **Add your own tickers.** Click **Add tickers**, type one or more symbols, and click **Rank tickers**. The site ranks each one the same way the getETF macro does and puts it in the bucket where it ranks first (details below).
+
+---
+
+## Add tickers tab
+
+1. Type ticker symbols, separated by commas or spaces (up to 100 at once), for example `NVDA, KO, NEM`.
+2. Click **Rank tickers**. For each stock, the site downloads daily prices since Jan 3, 2005 (or since it started trading) and averages its daily return in each macro quad, using the same quad calendar and method as `ETF_Bucketing.xlsm`. The table shows the rank order, the average daily return in each quad, and the bucket where it ranks first.
+3. Choose which tickers to keep and click **Add … ticker(s) to the model**. Each one goes into its best bucket, and it's removed from any other bucket it was in.
+
+Your buckets are saved in the page link, so they stay when you reload. Bookmark or share that link to keep them. To remove a ticker, delete it from its box in the sidebar. **Reset buckets to defaults** in the sidebar undoes all changes.
+
+### Saving default buckets (optional, owner only)
+Changes in the page link only apply to people using that link. To change the buckets everyone sees by default, the site can save them to this repo as `buckets.json`. Setting this up takes about 5 minutes:
+
+1. On GitHub, go to **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**. Give it access to **only** the `regime-model` repository, with **Contents: Read and write** permission. Copy the token.
+2. On share.streamlit.io, open the app's **⋮ menu → Settings → Secrets** and paste:
+   ```toml
+   GITHUB_TOKEN = "paste-your-token-here"
+   ADMIN_PASSWORD = "pick-a-password"
+   ```
+3. Save. On the **Add tickers** tab, enter the password and click **Save these buckets as the default**. The site restarts with the new defaults in about a minute.
+
+Keep the token private: never put it in the code or the README, only in Streamlit's Secrets box.
 
 ---
 
@@ -109,6 +133,7 @@ These results come from the spreadsheet version, Oct 12, 2018 – Nov 6, 2026.
 | File | What it is |
 |---|---|
 | `streamlit_app.py` | The website. Streamlit runs this file. |
+| `buckets.json` | Created when you save default buckets from the website (optional). If it exists, the site uses it instead of the buckets written in the code. |
 | `regime_model.py` | The same model as a script for Colab or your computer. It saves a CSV and charts and prints the lag test. |
 | `colab_quickstart.ipynb` | A Google Colab notebook that downloads `regime_model.py` from this repo and runs it. |
 | `requirements.txt` | Python packages the website installs. |

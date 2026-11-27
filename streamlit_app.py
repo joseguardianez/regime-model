@@ -354,7 +354,15 @@ def load_gex():
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def load_macro_inputs():
-    return lab.fetch_fred("GDPC1"), lab.fetch_fred("CPIAUCSL")
+    """GDP and CPI from FRED; if FRED can't be reached, the saved copy in the repo.
+    Returns (gdp, cpi, note)."""
+    try:
+        return lab.fetch_fred("GDPC1"), lab.fetch_fred("CPIAUCSL"), ""
+    except Exception as err:
+        gdp, cpi = lab.saved_macro()
+        return gdp, cpi, (f"FRED didn't respond ({err}), so this uses the saved copy in the "
+                          f"repo (CPI through {cpi.index[-1]:%b %Y}, GDP through "
+                          f"Q{(gdp.index[-1].month - 1) // 3 + 1} {gdp.index[-1].year}).")
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner="Downloading prices since 2005 for the Lab...")
@@ -366,7 +374,7 @@ def load_lab_prices(tickers):
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner="Running the optimizer: about a minute the first "
                                               "time, instant after that...")
-def run_lab(own_items):
+def run_lab(own_items, allow_hindsight=False):
     """Everything the optimizer needs, from 2005 on, then lab.run_optimizer."""
     own = {r: list(t) for r, t in own_items}
     tickers = sorted(set(t for v in own.values() for t in v) |
@@ -386,11 +394,12 @@ def run_lab(own_items):
     except Exception:
         notes.append("gamma (SqueezeMetrics didn't respond)")
     try:
-        gdp, cpi = load_macro_inputs()
+        gdp, cpi, _ = load_macro_inputs()
         extras["macro"], _ = lab.macro_quads(gdp, cpi, prices.index)
     except Exception:
-        notes.append("the GDP/CPI quad (FRED didn't respond)")
-    result = lab.run_optimizer(prices, votes, quad, own, cash, extras)
+        notes.append("the GDP/CPI quad (no GDP/CPI data)")
+    result = lab.run_optimizer(prices, votes, quad, own, cash, extras,
+                               allow_hindsight=allow_hindsight)
     result["missing"] = notes
     return result
 
@@ -1065,13 +1074,16 @@ with tab_lab:
             st.write("**What QQQ did over the next 20 trading days, by gamma level**")
             st.dataframe(pct_cols(pct_cols(gt, cols_ret), cols_pct, plus=False),
                          hide_index=True, width="stretch")
-    except Exception:
-        st.info("Couldn't reach SqueezeMetrics for gamma data right now. Try again later.")
+    except Exception as err:
+        st.info(f"Couldn't load gamma data from SqueezeMetrics right now "
+                f"({type(err).__name__}).")
 
     # ---- 3. Macro quad --------------------------------------------------------------------
     st.subheader("3. The quad from real economic data (GDP and CPI)")
     try:
-        gdp, cpi = load_macro_inputs()
+        gdp, cpi, macro_note = load_macro_inputs()
+        if macro_note:
+            st.caption(macro_note)
         lab_index = qqq_long.dropna().index
         mq, mdetail = lab.macro_quads(gdp, cpi, lab_index)
         last_q = mdetail.dropna(subset=["Macro quad"]).iloc[-1]
@@ -1103,8 +1115,8 @@ with tab_lab:
                              yaxis=dict(tickvals=[1, 2, 3, 4],
                                         ticktext=[f"{i + 1} {r}" for i, r in enumerate(REGIMES)]))
         st.plotly_chart(fig_mq, width="stretch")
-    except Exception:
-        st.info("Couldn't reach FRED for GDP and CPI data right now. Try again later.")
+    except Exception as err:
+        st.info(f"Couldn't load GDP and CPI data right now ({type(err).__name__}: {err}).")
 
     # ---- 4. Optimizer ---------------------------------------------------------------------
     st.subheader("4. Optimizer")
@@ -1121,9 +1133,17 @@ with tab_lab:
         "Trades happen the day after each signal and pay 5 basis points; cash earns the T-bill "
         "rate. The bucket sources include your current 20 stocks, so that row has a hindsight "
         "head start; the ETF and walk-forward versions don't.")
+    pick_from = st.radio(
+        "Pick the winner from", ["Sector ETFs and walk-forward picks (no hindsight)",
+                                 "Everything, including your 20 stocks (hindsight)"],
+        key="lab_pick_from", horizontal=True,
+        help="Your 20 stocks were chosen with getETF using data through 2026, which includes "
+             "the 2019+ test years, so they'd win partly by peeking. They're always shown in "
+             "the tables either way.")
     if st.button("Run the optimizer", type="primary") or st.session_state.get("lab_ran"):
         st.session_state["lab_ran"] = True
-        res = run_lab(tuple((r, tuple(buckets[r])) for r in REGIMES))
+        res = run_lab(tuple((r, tuple(buckets[r])) for r in REGIMES),
+                      allow_hindsight=pick_from.startswith("Everything"))
         if res["missing"]:
             st.warning("Ran without " + " and ".join(res["missing"]) + ".")
         td = res["today"]
@@ -1158,6 +1178,13 @@ with tab_lab:
                  f"dates; **{lk['share_as_good']:.0%}** of random versions did as well. "
                  + ("That's under 5%, so it looks like skill." if lk["share_as_good"] <= 0.05
                     else "That's over 5%, so luck can't be ruled out."))
+
+        st.write(f"**By bucket source:** how the versions did on the unseen 2019+ years. Buy "
+                 f"& hold QQQ's Sharpe there was {res['qqq_test_sharpe']:.2f}.")
+        bs = num_cols(res["by_source"], ["Median 2010-2018 Sharpe", "Median 2019+ Sharpe",
+                                         "Best 2019+ Sharpe"])
+        st.dataframe(pct_cols(bs, ["Beat QQQ's 2019+ Sharpe"], plus=False), hide_index=True,
+                     width="stretch")
 
         core = res["core"]
         st.write(f"**All {len(core)} versions, best on 2010-2018 first.** Does doing well "

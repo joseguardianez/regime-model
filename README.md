@@ -98,7 +98,7 @@ Research aimed at making the model better. The code is in `lab.py`.
 - **Smoothing** of 1, 5, 10 or 20 days, holding the top 1 or top 2 buckets.
 - **Extra filters:** half invested when gamma was negative; half invested the week after monthly expiration; half invested when the GDP/CPI quad isn't one of the buckets held; fully invested when VIX is above VIX3M.
 
-The best version is chosen using **2010-2018 only** and then graded on **2019 onward**, years it never saw. The tab shows that version against buy & hold QQQ and SPY and holding all 4 buckets equally, all 120+ versions with their before and after results, how well the 2010-2018 ranking predicted the 2019+ ranking, a luck test, this year's walk-forward buckets, and **today's pick**: which buckets and tickers the optimized model holds now and how much is invested.
+The best version is chosen using **2010-2018 only** and then graded on **2019 onward**, years it never saw. By default the winner can only come from the sector ETFs or the walk-forward picks: your 20 stocks were chosen with data that includes the test years, so they're shown for comparison but can't win unless you switch **Pick the winner from** to include them. If FRED can't be reached from the server, the GDP/CPI quad uses the saved copy in `macro_data.csv`. The tab shows that version against buy & hold QQQ and SPY and holding all 4 buckets equally, all 120+ versions with their before and after results, how well the 2010-2018 ranking predicted the 2019+ ranking, a luck test, this year's walk-forward buckets, and **today's pick**: which buckets and tickers the optimized model holds now and how much is invested.
 
 ---
 
@@ -176,6 +176,7 @@ These results come from the spreadsheet version, Oct 12, 2018 – Nov 6, 2026.
 |---|---|
 | `streamlit_app.py` | The website. Streamlit runs this file. |
 | `lab.py` | The Lab tab's research: expiration calendar, gamma, GDP/CPI quad, version 2 of the model and the optimizer. |
+| `macro_data.csv` | Saved copy of real GDP and CPI from FRED, used if FRED can't be reached. |
 | `regime_model.py` | The same model as a script for Colab or your computer. It saves a CSV and charts and prints the lag test. |
 | `colab_quickstart.ipynb` | A Google Colab notebook that downloads `regime_model.py` from this repo and runs it. |
 | `requirements.txt` | Python packages the website installs. |

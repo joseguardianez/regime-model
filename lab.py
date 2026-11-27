@@ -13,6 +13,8 @@ Everything here is plain pandas/numpy (no Streamlit), so it can also run in Cola
 """
 import io
 import itertools
+import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -32,8 +34,10 @@ ETF_BUCKETS = {
 }
 BENCHMARKS = ["QQQ", "SPY"]
 GEX_URL = "https://squeezemetrics.com/monitor/static/DIX.csv"
-FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}"
-UA = {"User-Agent": "Mozilla/5.0 (regime-model research app)"}
+FRED_URLS = ["https://fred.stlouisfed.org/graph/fredgraph.csv?id={}",
+             "https://fred.stlouisfed.org/data/{}.txt"]
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 
 # ----------------------------------------------------------------------------------
@@ -166,13 +170,38 @@ def gex_table(gex, asset, days=20):
 # ----------------------------------------------------------------------------------
 # Top-down macro quad from FRED (real GDP and CPI)
 # ----------------------------------------------------------------------------------
+def parse_fred(text):
+    """FRED data as a Series, from either the CSV download or the plain-text page."""
+    rows = re.findall(r"^(\d{4}-\d{2}-\d{2})[,\s]+(-?\d+(?:\.\d+)?)\s*$", text, flags=re.M)
+    s = pd.Series([float(v) for _, v in rows], index=pd.to_datetime([d for d, _ in rows]))
+    return s[~s.index.duplicated()].sort_index()
+
+
 def fetch_fred(series_id):
-    r = requests.get(FRED_URL.format(series_id), headers=UA, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    s = pd.to_numeric(df.iloc[:, 1], errors="coerce")
-    s.index = pd.to_datetime(df.iloc[:, 0])
-    return s.dropna()
+    """Download a FRED series, trying two addresses. Raises if both fail."""
+    errors = []
+    for url in FRED_URLS:
+        try:
+            r = requests.get(url.format(series_id), headers=UA, timeout=20)
+            r.raise_for_status()
+            s = parse_fred(r.text)
+            if len(s) > 20:
+                return s
+            errors.append(f"{url.split('/')[3]}: no data")
+        except Exception as err:
+            errors.append(f"{type(err).__name__}")
+    raise RuntimeError(f"FRED {series_id}: " + "; ".join(errors))
+
+
+SAVED_MACRO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "macro_data.csv")
+
+
+def saved_macro():
+    """Saved copy of GDPC1 and CPIAUCSL from FRED (macro_data.csv in the repo), used when FRED
+    can't be reached from the server."""
+    df = pd.read_csv(SAVED_MACRO, parse_dates=["date"])
+    return tuple(df[df["series"] == sid].set_index("date")["value"].sort_index()
+                 for sid in ("GDPC1", "CPIAUCSL"))
 
 
 def _asof(s, index):
@@ -342,12 +371,16 @@ def exposure_series(index, weights, on, extras):
     return e
 
 
+HINDSIGHT_SOURCE = "Your 20 stocks"
+
+
 def run_optimizer(prices, votes, quad, own_buckets, cash_ret, extras, start="2010-01-01",
-                  train_end="2018-12-31", delay=1, cost=0.0005, seed=0):
+                  train_end="2018-12-31", delay=1, cost=0.0005, seed=0, allow_hindsight=False):
     """Stage 1: try every core setup (bucket source x scoring x settings x how many buckets)
     and rank them on 2010-2018 only. Stage 2: add every combination of the extra filters to
     the best one, again judged on 2010-2018 only. Then report 2019-onward results, which the
-    optimizer never saw."""
+    optimizer never saw. Unless allow_hindsight, the winner can't come from your 20 stocks,
+    because they were picked with data that includes the test years."""
     index = prices.loc[start:].index
     full_index = prices.index
     last_year = index[-1].year
@@ -403,7 +436,8 @@ def run_optimizer(prices, votes, quad, own_buckets, cash_ret, extras, start="201
         series[name] = (w, r)
     core = pd.DataFrame(rows).sort_values("Train Sharpe", ascending=False).reset_index(drop=True)
     rho = spearman(core["Train Sharpe"], core["Test Sharpe"])
-    best = core.iloc[0]
+    eligible = core if allow_hindsight else core[core["Source"] != HINDSIGHT_SOURCE]
+    best = eligible.iloc[0]
     w_best, _ = series[best["Setup"]]
     src_best = best["Source"]
 
@@ -443,6 +477,19 @@ def run_optimizer(prices, votes, quad, own_buckets, cash_ret, extras, start="201
                         "2010-2018 Sharpe": tr["Sharpe"], "2019+ per year": te["Per year"],
                         "2019+ Sharpe": te["Sharpe"], "2019+ worst drop": te["Worst drop"]})
 
+    # How each bucket source did overall, against buy & hold QQQ on the unseen years
+    qqq_test = stats(rets_all["QQQ"].loc[test], cash)["Sharpe"] if "QQQ" in prices else np.nan
+    by_source = []
+    for src_name, grp in core.groupby("Source", sort=False):
+        by_source.append({"Bucket source": src_name + (" (picked with hindsight)"
+                                                       if src_name == HINDSIGHT_SOURCE else ""),
+                          "Versions": len(grp),
+                          "Median 2010-2018 Sharpe": grp["Train Sharpe"].median(),
+                          "Median 2019+ Sharpe": grp["Test Sharpe"].median(),
+                          "Best 2019+ Sharpe": grp["Test Sharpe"].max(),
+                          "Beat QQQ's 2019+ Sharpe": (grp["Test Sharpe"] > qqq_test).mean()})
+    by_source = pd.DataFrame(by_source)
+
     # Luck test on the unseen years: same picks, shifted to random dates
     rng = np.random.default_rng(seed)
     wt = w_best.loc[test_start:].dropna(how="all")
@@ -466,4 +513,5 @@ def run_optimizer(prices, votes, quad, own_buckets, cash_ret, extras, start="201
              "exposure": float(e_pick.dropna().iloc[-1]), "setup": final_name}
     return {"core": core, "rho": rho, "overlays": over, "summary": pd.DataFrame(summary),
             "curves": curves, "test_start": test_start, "luck": luck, "today": today,
-            "walk_forward": wf, "best_source": src_best}
+            "walk_forward": wf, "best_source": src_best, "by_source": by_source,
+            "qqq_test_sharpe": qqq_test}

@@ -13,14 +13,9 @@ Put it online for free:      push this file + requirements.txt to GitHub, then d
 Prices come from Yahoo Finance and refresh every few hours (or with the Refresh button).
 """
 
-import base64
-import json
-import os
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -60,7 +55,6 @@ QUAD_RUNS = (
     "27-01:2"
 )
 QUAD_START = "2005-01-03"
-DEFAULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets.json")
 
 # Indicator windows (same as the spreadsheet)
 HV_DAYS = 5                    # D: HV-5
@@ -113,6 +107,22 @@ def load_prices(tickers, start):
     adj = adj.dropna(how="all")                      # keep stock-market days only
     vix = vix.reindex(adj.index).ffill()
     return adj, vix
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner="Downloading prices from Yahoo Finance...")
+def load_asset(ticker, start):
+    """Adj Close for one comparison ticker: any Yahoo symbol, such as a stock, an ETF,
+    an index (^GSPC) or crypto (BTC-USD). Empty if Yahoo has nothing for it."""
+    for symbol in dict.fromkeys([ticker, ticker.replace(".", "-")]):   # BRK.B -> BRK-B
+        data = yf.download(symbol, start=start, auto_adjust=False, progress=False)
+        if data is None or data.empty:
+            continue
+        col = "Adj Close" if "Adj Close" in data.columns.get_level_values(0) else "Close"
+        s = data[col]
+        s = (s.iloc[:, 0] if isinstance(s, pd.DataFrame) else s).dropna()
+        if len(s):
+            return s.rename(ticker)
+    return pd.Series(dtype=float, name=ticker)
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner="Downloading warning-signal data...")
@@ -243,18 +253,6 @@ def parse_tickers(text):
     return out
 
 
-def load_defaults():
-    """Default buckets: buckets.json in the repo if it exists, otherwise the ones in this file."""
-    try:
-        with open(DEFAULTS_FILE) as f:
-            cfg = json.load(f)
-        buckets = {r: [str(t).upper() for t in cfg["buckets"][r]] for r in REGIMES}
-        outside = [str(t).upper() for t in cfg.get("outside", DEFAULT_OUTSIDE)]
-        return buckets, outside
-    except Exception:
-        return DEFAULT_BUCKETS, DEFAULT_OUTSIDE
-
-
 def quad_for_dates(index):
     """Macro quad (1-4) for each date, from the ETF_Bucketing calendar."""
     runs = [s.split(":") for s in QUAD_RUNS.split(";")]
@@ -311,30 +309,21 @@ def add_to_buckets(assignments):
             st.session_state[key] = ", ".join(names)
 
 
-def save_defaults_to_github(buckets, outside):
-    """Commit buckets.json to the GitHub repo so the new buckets become everyone's default.
-    Needs GITHUB_TOKEN (and optionally GITHUB_REPO) in the app's Streamlit secrets."""
-    token = st.secrets["GITHUB_TOKEN"]
-    repo = st.secrets.get("GITHUB_REPO", "joseguardianez/regime-model")
-    url = f"https://api.github.com/repos/{repo}/contents/buckets.json"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    current = requests.get(url, headers=headers, timeout=20)
-    body = {
-        "message": "Update default buckets from the website",
-        "content": base64.b64encode(json.dumps({"buckets": buckets, "outside": outside},
-                                               indent=2).encode()).decode(),
-    }
-    if current.status_code == 200:
-        body["sha"] = current.json()["sha"]
-    result = requests.put(url, headers=headers, json=body, timeout=20)
-    return result.status_code in (200, 201), result.status_code
-
-
-def secret(name):
-    try:
-        return st.secrets[name]
-    except Exception:
-        return None
+def add_compare(key):
+    """Callback for the Compare against boxes: clean up a typed ticker and, if Yahoo has
+    data for it, save it to Outside assets so it stays in the list (and in the page link)."""
+    t = (st.session_state.get(key) or "").strip().upper()
+    if not t:
+        return
+    start = str(st.session_state.get("start", DEFAULT_START))
+    saved = parse_tickers(st.session_state["outside_text"])
+    if load_asset(t, start).empty:
+        st.session_state["compare_error"] = t
+        st.session_state[key] = saved[0] if saved else None
+        return
+    st.session_state[key] = t
+    if t not in saved:
+        st.session_state["outside_text"] = ", ".join(saved + [t])
 
 
 def reset_buckets():
@@ -354,7 +343,7 @@ st.title("Bottoms-Up Regime Segmentation")
 
 # Buckets come from the page link (?q1=...&q2=...) if it has them, otherwise the defaults.
 # That way changes stick when you reload, and you can bookmark or share the link.
-default_buckets, default_outside = load_defaults()
+default_buckets, default_outside = DEFAULT_BUCKETS, DEFAULT_OUTSIDE
 if "buckets_ready" not in st.session_state:
     qp = st.query_params
     for i, r in enumerate(REGIMES):
@@ -366,7 +355,7 @@ if "buckets_ready" not in st.session_state:
 
 with st.sidebar:
     st.header("Settings")
-    start = st.date_input("Start date", pd.Timestamp(DEFAULT_START))
+    start = st.date_input("Start date", pd.Timestamp(DEFAULT_START), key="start")
     smooth_days = st.slider("Smoothing (days)", 5, 40, 19,
                             help="The spreadsheet uses a 19-day average of the raw votes.")
     st.subheader("Buckets")
@@ -374,7 +363,9 @@ with st.sidebar:
     for r in REGIMES:
         st.text_input(r, key=f"bucket_{r}")
         buckets[r] = parse_tickers(st.session_state[f"bucket_{r}"])
-    st.text_input("Outside assets", key="outside_text")
+    st.text_input("Outside assets", key="outside_text",
+                  help="Tickers to compare the model against. Any Yahoo Finance symbol works. "
+                       "You can also type a new one straight into a Compare against box.")
     outside_assets = parse_tickers(st.session_state["outside_text"])
     st.button("Reset buckets to defaults", on_click=reset_buckets)
     st.subheader("Warning signals")
@@ -387,7 +378,6 @@ with st.sidebar:
 
 # Keep the page link in step with the buckets, so a reload or bookmark keeps them
 user_buckets = {r: list(buckets[r]) for r in REGIMES}
-user_outside = list(outside_assets)
 link_params = {f"q{i + 1}": ",".join(buckets[r]) for i, r in enumerate(REGIMES)}
 link_params["out"] = ",".join(outside_assets)
 if all(buckets[r] == default_buckets[r] for r in REGIMES) and outside_assets == default_outside:
@@ -401,11 +391,12 @@ if any(len(buckets[r]) == 0 for r in REGIMES):
     st.error("Every bucket needs at least one ticker.")
     st.stop()
 
-prices_all, vix = load_prices(tuple(stocks + outside_assets), str(start))
+prices_all, vix = load_prices(tuple(stocks), str(start))
+outside_data = {t: load_asset(t, str(start)) for t in outside_assets}
 
 # Tickers Yahoo didn't return
-missing = [t for t in stocks + outside_assets
-           if t not in prices_all.columns or prices_all[t].isna().all()]
+missing = [t for t in stocks if t not in prices_all.columns or prices_all[t].isna().all()]
+missing += [t for t in outside_assets if outside_data[t].empty]
 if missing:
     st.warning(f"No data from Yahoo for: {', '.join(missing)}. Check the ticker spelling.")
 buckets = {r: [t for t in names if t not in missing] for r, names in buckets.items()}
@@ -416,10 +407,30 @@ if any(len(buckets[r]) == 0 for r in REGIMES):
 
 stocks = sorted({t for names in buckets.values() for t in names})
 prices = prices_all[stocks].dropna(how="all")
-outside = prices_all.reindex(prices.index)[outside_assets]
+outside = pd.DataFrame({t: outside_data[t] for t in outside_assets}, index=prices.index)
 votes, raw, score, winner_num = build_regimes(prices, vix.reindex(prices.index), buckets, smooth_days)
 last = winner_num.last_valid_index()
 st.caption(f"Data through {last.date()} · Yahoo Finance · refreshes every 6 hours")
+if st.session_state.get("compare_error"):
+    st.warning(f"No data from Yahoo for {st.session_state.pop('compare_error')}. "
+               "Check the spelling (indexes start with ^, like ^GSPC; crypto looks like BTC-USD).")
+
+
+def compare_box(label, key):
+    """Pick a saved outside asset or type any ticker. Returns (ticker, its prices)."""
+    t = st.selectbox(label, outside_assets, index=0 if outside_assets else None, key=key,
+                     accept_new_options=True, on_change=add_compare, args=(key,),
+                     placeholder="Type any ticker, e.g. SPY",
+                     help="Pick one from the list or type any Yahoo Finance symbol: a stock, an "
+                          "ETF, an index like ^GSPC, or crypto like BTC-USD. New tickers are "
+                          "added to Outside assets in the sidebar.")
+    if not t:
+        return None, None
+    px = outside[t] if t in outside else load_asset(t, str(start)).reindex(prices.index)
+    if px.dropna().empty:
+        st.warning(f"No data from Yahoo for {t}.")
+        return None, None
+    return t, px
 
 tab_model, tab_signals, tab_add = st.tabs(["Regime model", "Warning signals", "Add tickers"])
 
@@ -436,13 +447,13 @@ with tab_model:
                    f"{score.loc[last, r] - score.loc[week_ago, r]:+.2f} vs 1 wk ago")
 
     # Chart 1: regime scores with an outside asset on the right axis
-    asset = st.selectbox("Compare against", outside_assets) if outside_assets else None
+    asset, asset_px = compare_box("Compare against (pick one or type any ticker)", "cmp_model")
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     for r in REGIMES:
         fig.add_trace(go.Scatter(x=score.index, y=score[r], name=r,
                                  line=dict(color=COLORS[r], width=1.5)), secondary_y=False)
     if asset:
-        fig.add_trace(go.Scatter(x=outside.index, y=outside[asset], name=asset,
+        fig.add_trace(go.Scatter(x=asset_px.index, y=asset_px, name=asset,
                                  line=dict(color="black", width=2)), secondary_y=True)
     fig.update_yaxes(title_text="Regime score (share of stocks voting buy)", range=[0, 1],
                      secondary_y=False)
@@ -466,7 +477,7 @@ with tab_model:
         st.subheader("Lag test")
         if asset:
             regime_for_lag = st.selectbox("Regime score", REGIMES, index=0)
-            corr = lag_test(score[regime_for_lag], outside[asset])
+            corr = lag_test(score[regime_for_lag], asset_px)
             best = int(corr.idxmax())
             st.write(f"**{regime_for_lag}** matches **{asset}**'s 20-day return best "
                      f"**{best} trading days back** (correlation {corr[best]:.2f}, "
@@ -478,7 +489,7 @@ with tab_model:
                               margin=dict(t=10))
             st.plotly_chart(bar, width="stretch")
         else:
-            st.info("Add an outside asset in the sidebar to run the lag test.")
+            st.info("Pick or type a ticker in Compare against to run the lag test.")
 
     # Latest votes
     with right:
@@ -537,24 +548,6 @@ with tab_add:
                "Bookmark or share the link to keep them. To remove a ticker, delete it from its "
                "box in the sidebar. **Reset buckets to defaults** in the sidebar undoes everything.")
 
-    st.subheader("Save as the default for everyone")
-    if secret("GITHUB_TOKEN") and secret("ADMIN_PASSWORD"):
-        password = st.text_input("Admin password", type="password", key="admin_pw")
-        if st.button("Save these buckets as the default"):
-            if password == secret("ADMIN_PASSWORD"):
-                ok, code = save_defaults_to_github(user_buckets, user_outside)
-                if ok:
-                    st.success("Saved to GitHub. The site restarts with the new defaults in "
-                               "about a minute.")
-                else:
-                    st.error(f"GitHub refused the save (error {code}). Check the token.")
-            else:
-                st.error("Wrong password.")
-    else:
-        st.info("Not set up yet. To let this page change the defaults for everyone, add a "
-                "GITHUB_TOKEN and an ADMIN_PASSWORD to the app's secrets (see "
-                "'Saving default buckets' in the README).")
-
 # ==================================================================================
 # Tab 2: warning signals
 # ==================================================================================
@@ -564,15 +557,13 @@ with tab_signals:
         "a simple risk-off warning (1) or all-clear (0), tested for whether it leads or lags the "
         "market, and checked against what the market did next. None of them is reliable on its "
         "own; the point is to test them.")
-    if not outside_assets:
-        st.info("Add an outside asset in the sidebar (for example QQQ) to test the signals.")
+    sig_asset, asset_px = compare_box("Test against (pick one or type any ticker)", "sig_asset")
+    if sig_asset is None:
+        st.info("Pick or type a ticker in Test against to test the signals.")
         st.stop()
     if not chosen:
         st.info("Pick at least one signal in the sidebar.")
         st.stop()
-
-    sig_asset = st.selectbox("Test against", outside_assets, key="sig_asset")
-    asset_px = outside[sig_asset]
 
     sig_tickers = sorted({t for name in chosen for t in SIGNALS[name]["tickers"]})
     sig_px = load_signal_prices(tuple(sig_tickers), str(start)).reindex(prices.index).ffill()

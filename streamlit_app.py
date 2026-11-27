@@ -506,7 +506,8 @@ with tab_model:
         table[f"{r} (Raw Votes%)"] = raw[r]
         table[f"{r} score"] = score[r]
     table["Regime Winner"] = winner_num
-    table = table.join(outside)
+    # "price" in the name keeps a compared stock (e.g. NVDA) from clashing with its vote column
+    table = table.join(outside.add_suffix(" price"))
     with st.expander("All data"):
         st.dataframe(table.dropna(subset=["Regime Winner"]).iloc[::-1], width="stretch")
     st.download_button("Download CSV", table.to_csv(index_label="Date"), "regime_output.csv",

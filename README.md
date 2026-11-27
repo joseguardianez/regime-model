@@ -22,7 +22,7 @@ This project estimates which economic regime the market is pricing in, from the 
    - Use **Compare against** to switch the outside asset. Pick one from the list (QQQ, AMD) or type **any ticker**: a stock, an ETF, an index like `^GSPC`, or crypto like `BTC-USD`. A ticker you type is added to your list so you can switch back to it.
 6. **Check the Regime Winner chart.** It shows which regime was on top each day, numbered 1 to 4.
 7. **Look at the lag test.** It shows how many trading days the regime score trails the outside asset. The blue bar marks the best match.
-8. **See today's votes.** The **Votes on …** table lists every stock and whether it's voting BUY or SELL on the latest day.
+8. **See today's votes.** The **Votes on …** table lists every stock and whether it's voting BUY or SELL on the latest day. Click any stock (here, in the **Add tickers** tables, or the link under **Compare against**) to open its Yahoo Finance page.
 9. **Change the settings (optional).** Open the sidebar to edit the settings. On a phone, tap the **>>** arrow at the top left.
    - **Start date:** how far back to go.
    - **Smoothing (days):** 19 matches the spreadsheet. Smaller numbers react faster but jump around more.

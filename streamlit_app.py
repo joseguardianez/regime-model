@@ -243,6 +243,17 @@ def forward_returns(flag, asset, days=20):
 # ----------------------------------------------------------------------------------
 # Adding tickers: getETF-style ranking, saved buckets
 # ----------------------------------------------------------------------------------
+def yahoo_url(ticker):
+    """Yahoo Finance page for a ticker (Yahoo writes BRK.B as BRK-B)."""
+    return "https://finance.yahoo.com/quote/" + ticker.replace(".", "-") if ticker else None
+
+
+def yahoo_column(label):
+    """Table column that shows the ticker and opens its Yahoo Finance page when clicked."""
+    return st.column_config.LinkColumn(label, display_text=r"https://finance\.yahoo\.com/quote/(.+)",
+                                       help="Click a ticker to open it on Yahoo Finance")
+
+
 def parse_tickers(text):
     """'tsla, panw  meta' -> ['TSLA', 'PANW', 'META'] (commas or spaces, no repeats)."""
     out = []
@@ -430,6 +441,7 @@ def compare_box(label, key):
     if px.dropna().empty:
         st.warning(f"No data from Yahoo for {t}.")
         return None, None
+    st.caption(f"[Open {t} on Yahoo Finance ↗]({yahoo_url(t)})")
     return t, px
 
 tab_model, tab_signals, tab_add = st.tabs(["Regime model", "Warning signals", "Add tickers"])
@@ -498,7 +510,10 @@ with tab_model:
             [(r, t, "BUY" if votes.loc[last, t] == 1 else "SELL")
              for r in REGIMES for t in buckets[r]],
             columns=["Regime", "Stock", "Vote"])
-        st.dataframe(latest, hide_index=True, width="stretch", height=280)
+        latest["Stock"] = latest["Stock"].map(yahoo_url)
+        st.dataframe(latest, hide_index=True, width="stretch", height=280,
+                     column_config={"Stock": yahoo_column("Stock")})
+        st.caption("Click a stock to open its Yahoo Finance page.")
 
     # Full data download
     table = votes.copy()
@@ -531,7 +546,8 @@ with tab_add:
             st.warning("Type at least one ticker first.")
     ranked = st.session_state.get("ranked")
     if ranked is not None and len(ranked):
-        st.dataframe(ranked, hide_index=True, width="stretch")
+        st.dataframe(ranked.assign(Ticker=ranked["Ticker"].map(yahoo_url)), hide_index=True,
+                     width="stretch", column_config={"Ticker": yahoo_column("Ticker")})
         valid = ranked.dropna(subset=["Best quad"]).set_index("Ticker")
         if len(valid):
             pick_add = st.multiselect("Add these to their best bucket", list(valid.index),
@@ -543,9 +559,12 @@ with tab_add:
     st.divider()
     st.subheader("Current buckets")
     longest = max(len(v) for v in user_buckets.values())
-    st.dataframe(pd.DataFrame({r: user_buckets[r] + [""] * (longest - len(user_buckets[r]))
-                               for r in REGIMES}), hide_index=True, width="stretch")
-    st.caption("Your changes are saved in this page's link, so they stay when you reload. "
+    st.dataframe(pd.DataFrame({r: [yahoo_url(t) for t in user_buckets[r]]
+                               + [None] * (longest - len(user_buckets[r])) for r in REGIMES}),
+                 hide_index=True, width="stretch",
+                 column_config={r: yahoo_column(r) for r in REGIMES})
+    st.caption("Click a ticker to open its Yahoo Finance page. "
+               "Your changes are saved in this page's link, so they stay when you reload. "
                "Bookmark or share the link to keep them. To remove a ticker, delete it from its "
                "box in the sidebar. **Reset buckets to defaults** in the sidebar undoes everything.")
 
@@ -657,7 +676,9 @@ with tab_signals:
     st.subheader("Look at one signal")
     pick = st.selectbox("Signal", list(signals), key="sig_pick")
     s = signals[pick]
-    st.caption(SIGNALS[pick]["about"])
+    st.caption(SIGNALS[pick]["about"] + "  \nOn Yahoo Finance: " + " · ".join(
+        f"[{t.replace('^', chr(92) + '^')}]({yahoo_url(t)})"      # \^ so ^VIX isn't read as a footnote
+        for t in SIGNALS[pick]["tickers"]))
     fig4 = make_subplots(specs=[[{"secondary_y": True}]])
     fig4.add_trace(go.Scatter(x=s.index, y=s["level"], name=pick,
                               line=dict(color="#2a7de1", width=1.5)), secondary_y=False)

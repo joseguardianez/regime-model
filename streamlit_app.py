@@ -13,6 +13,8 @@ Put it online for free:      push this file + requirements.txt to GitHub, then d
 Prices come from Yahoo Finance and refresh every few hours (or with the Refresh button).
 """
 
+import itertools
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -241,6 +243,106 @@ def forward_returns(flag, asset, days=20):
 
 
 # ----------------------------------------------------------------------------------
+# Backtesting
+# ----------------------------------------------------------------------------------
+def winner_from(raw, smooth):
+    """Regime Winner and loser (1-4) for a given smoothing, with the sheet's tie rule."""
+    sc = raw.rolling(smooth).mean()
+    ready = sc.dropna().round(10)
+    num = {r: i + 1 for i, r in enumerate(REGIMES)}
+    win = ready.idxmax(axis=1).map(num).reindex(sc.index)
+    lose = ready.idxmin(axis=1).map(num).reindex(sc.index)
+    return win, lose
+
+
+def hold(pos, asset_ret, cash_ret, delay, cost):
+    """Daily returns of keeping `pos` (0 to 1) in the asset and the rest in cash. The position
+    is decided at a close and traded `delay` days later; `cost` is charged per 100% traded."""
+    held = pos.shift(delay)
+    return held * asset_ret + (1 - held) * cash_ret - held.diff().abs().fillna(0) * cost
+
+
+def rotate(choice, bucket_ret, cash_ret, delay, cost):
+    """Hold the bucket picked each day (1-4) at equal weight. Switching buckets means selling
+    everything and buying the new bucket, so it costs 2x."""
+    held = choice.shift(delay)
+    vals, idx = bucket_ret.to_numpy(), held.to_numpy()
+    out = np.full(len(held), np.nan)
+    ok = ~np.isnan(idx)
+    out[ok] = vals[np.flatnonzero(ok), idx[ok].astype(int) - 1]
+    ret = pd.Series(out, index=held.index).fillna(cash_ret)
+    switched = (held != held.shift()) & held.notna() & held.shift().notna()
+    return ret - switched.astype(float) * 2 * cost
+
+
+def perf(ret, cash_ret, pos=None):
+    """Summary stats for a daily return series."""
+    ret = ret.dropna()
+    if len(ret) < 60:
+        return {}
+    years = len(ret) / 252
+    growth = (1 + ret).cumprod()
+    excess = ret - cash_ret.reindex(ret.index).fillna(0)
+    sd = ret.std()
+    out = {"Total return": growth.iloc[-1] - 1,
+           "Per year (CAGR)": growth.iloc[-1] ** (1 / years) - 1,
+           "Volatility": sd * np.sqrt(252),
+           "Sharpe": excess.mean() / sd * np.sqrt(252) if sd > 0 else np.nan,
+           "Worst drop": (growth / growth.cummax() - 1).min()}
+    if pos is not None:
+        p = pos.reindex(ret.index)
+        out["Time invested"] = p.mean()
+        out["Trades per year"] = (p.diff().abs() > 0).sum() / years
+    return out
+
+
+def sharpe_of(ret, cash_ret):
+    sd = ret.std()
+    return (ret - cash_ret).mean() / sd * np.sqrt(252) if sd > 0 else np.nan
+
+
+def fmt_perf(rows):
+    """Format a {name: perf dict} table for display."""
+    df = pd.DataFrame(rows).T
+    for col in df.columns:
+        if col in ("Sharpe", "Trades per year"):
+            df[col] = df[col].map(lambda x: "" if pd.isna(x) else f"{x:.2f}" if col == "Sharpe"
+                                  else f"{x:.1f}")
+        else:
+            df[col] = df[col].map(lambda x: "" if pd.isna(x) else f"{x:+.1%}"
+                                  if col in ("Total return", "Per year (CAGR)", "Worst drop")
+                                  else f"{x:.0%}")
+    return df.rename_axis("Strategy").reset_index()
+
+
+def signal_flags(names, lookback):
+    """Warning flags for the chosen signals (same rules as the Warning signals tab)."""
+    tickers = sorted({t for n in names for t in SIGNALS[n]["tickers"]})
+    if not tickers:
+        return {}
+    px = load_signal_prices(tuple(tickers), str(start)).reindex(prices.index).ffill()
+    out = {}
+    for n in names:
+        result = compute_signal(SIGNALS[n], px, lookback)
+        if result is not None:
+            out[n] = result
+    return out
+
+
+def luck_test(ret_fn, series, n=1000, seed=0):
+    """Shift the strategy's timing by a random amount (keeps how often and how long it is in
+    each state) and see how often random timing does as well. Returns the share of random
+    versions with a Sharpe at least as high as the real one."""
+    rng = np.random.default_rng(seed)
+    real = ret_fn(series)
+    vals = series.to_numpy()
+    sims = []
+    for k in rng.integers(126, max(127, len(vals) - 126), n):
+        sims.append(ret_fn(pd.Series(np.roll(vals, k), index=series.index)))
+    sims = np.array(sims)
+    return real, sims, float((sims >= real).mean())
+
+# ----------------------------------------------------------------------------------
 # Adding tickers: getETF-style ranking, saved buckets
 # ----------------------------------------------------------------------------------
 def yahoo_url(ticker):
@@ -444,7 +546,8 @@ def compare_box(label, key):
     st.caption(f"[Open {t} on Yahoo Finance ↗]({yahoo_url(t)})")
     return t, px
 
-tab_model, tab_signals, tab_add = st.tabs(["Regime model", "Warning signals", "Add tickers"])
+tab_model, tab_signals, tab_add, tab_bt = st.tabs(
+    ["Regime model", "Warning signals", "Add tickers", "Backtest"])
 
 # ==================================================================================
 # Tab 1: the regime model
@@ -567,6 +670,252 @@ with tab_add:
                "Your changes are saved in this page's link, so they stay when you reload. "
                "Bookmark or share the link to keep them. To remove a ticker, delete it from its "
                "box in the sidebar. **Reset buckets to defaults** in the sidebar undoes everything.")
+
+# ==================================================================================
+# Tab 4: backtest (written before tab 2's code so tab 2 can stop early safely)
+# ==================================================================================
+with tab_bt:
+    st.markdown(
+        "Does the model actually work? This tab checks (1) whether it picks the same quad as the "
+        "ETF_Bucketing quad calendar, and (2) whether trading on it would have beaten just "
+        "holding. **No peeking:** a signal at one day's close is traded at the close a day or "
+        "more later, and every strategy is tested over the same dates.")
+    c1, c2 = st.columns(2)
+    with c1:
+        bt_asset, bt_px = compare_box("Backtest on (pick one or type any ticker)", "bt_asset")
+    with c2:
+        invest_in = st.multiselect("Regime strategy: be invested during these regimes (cash "
+                                   "otherwise)", REGIMES, default=["Disinflation", "Reflation"],
+                                   key="bt_regimes")
+    c3, c4, c5, c6 = st.columns(4)
+    delay = c3.slider("Trade delay (days)", 1, 5, 1, key="bt_delay",
+                      help="1 = trade at the next day's close after the signal.")
+    cost = c4.slider("Cost per trade (basis points)", 0, 50, 5, key="bt_cost",
+                     help="1 basis point = 0.01% of the amount traded.") / 10000
+    warn_n = c5.slider("Warning strategy: go to cash at this many warnings", 1, 7, 4,
+                       key="bt_warn")
+    use_tbill = c6.checkbox("Cash earns the T-bill rate", True, key="bt_tbill",
+                            help="Uses the 3-month Treasury yield (^IRX). Off = cash earns 0%.")
+
+    if bt_asset is None or not invest_in:
+        st.info("Pick a ticker and at least one regime to run the backtest.")
+    else:
+        # ---- Inputs -------------------------------------------------------------
+        asset_ret = bt_px.pct_change()
+        cash_ret = pd.Series(0.0, index=prices.index)
+        if use_tbill:
+            irx = load_signal_prices(("^IRX",), str(start))
+            if "^IRX" in irx:
+                cash_ret = (yield_pct(irx["^IRX"]).reindex(prices.index).ffill() / 100 / 252
+                            ).fillna(0)
+        stock_ret = prices.pct_change()
+        bucket_ret = pd.DataFrame({r: stock_ret[buckets[r]].mean(axis=1) for r in REGIMES})
+        all_ret = stock_ret[stocks].mean(axis=1)
+        _, loser = winner_from(raw, smooth_days)
+        nums = [REGIMES.index(r) + 1 for r in invest_in]
+        sigs = signal_flags(chosen, lookback) if chosen else {}
+        warn_cnt = (pd.DataFrame({n: s["warning"] for n, s in sigs.items()})
+                    .sum(axis=1, min_count=1) if sigs else None)
+
+        valid = winner_num.notna() & bt_px.notna()
+        if warn_cnt is not None:
+            valid &= warn_cnt.notna()
+        if valid.sum() < 260:
+            st.warning("Less than a year of overlapping data. Pick an earlier start date.")
+        else:
+            first = valid.idxmax()
+            window = prices.index[prices.index.get_loc(first) + delay:]
+            asset_ret, cash_w = asset_ret.fillna(0), cash_ret
+
+            # ---- Strategies -----------------------------------------------------------
+            pos = {}
+            pos[f"Buy & hold {bt_asset}"] = pd.Series(1.0, index=prices.index)
+            regime_on = winner_num.isin(nums).astype(float).where(winner_num.notna())
+            label_rf = f"Regime strategy ({' + '.join(invest_in)})"
+            pos[label_rf] = regime_on
+            pos["Opposite of regime strategy"] = 1 - regime_on
+            if warn_cnt is not None:
+                pos[f"Cash at {warn_n}+ warnings"] = (warn_cnt < warn_n).astype(float).where(
+                    warn_cnt.notna())
+            rets = {k: hold(p, asset_ret, cash_ret, delay, cost) for k, p in pos.items()}
+            rets["Winning bucket's stocks"] = rotate(winner_num, bucket_ret, cash_ret, delay, cost)
+            rets["Losing bucket's stocks"] = rotate(loser, bucket_ret, cash_ret, delay, cost)
+            rets["All bucket stocks (equal weight)"] = all_ret
+            rets = pd.DataFrame(rets).loc[window]
+            if rets.isna().any().any():
+                rets = rets.fillna(0)
+
+            st.subheader("1. Strategy results")
+            st.caption(f"{window[0]:%b %d, %Y} to {window[-1]:%b %d, %Y} "
+                       f"({len(window) / 252:.1f} years). Sharpe = return above cash per unit "
+                       "of risk; above 1 is very good, below 0.5 is weak.")
+            rows = {k: perf(rets[k], cash_w, pos.get(k)) for k in rets}
+            st.dataframe(fmt_perf(rows), hide_index=True, width="stretch")
+
+            growth = 10000 * (1 + rets).cumprod()
+            fig_g = go.Figure([go.Scatter(x=growth.index, y=growth[k], name=k,
+                                          line=dict(width=2 if i < 2 else 1.2))
+                               for i, k in enumerate(growth)])
+            fig_g.update_layout(height=430, title="Growth of $10,000 (log scale)",
+                                yaxis_type="log", hovermode="x unified",
+                                legend=dict(orientation="h", y=-0.15), margin=dict(t=40))
+            st.plotly_chart(fig_g, width="stretch")
+            dd = growth / growth.cummax() - 1
+            fig_d = go.Figure([go.Scatter(x=dd.index, y=dd[k], name=k, line=dict(width=1.2))
+                               for k in list(dd)[:4]])
+            fig_d.update_layout(height=260, title="Drawdowns (drop from the last high)",
+                                yaxis_tickformat=".0%", hovermode="x unified",
+                                legend=dict(orientation="h", y=-0.25), margin=dict(t=40))
+            st.plotly_chart(fig_d, width="stretch")
+
+            # ---- Accuracy vs the quad calendar ---------------------------------------
+            st.subheader("2. Does it pick the right quad?")
+            cal = quad_for_dates(prices.index)
+            both = pd.DataFrame({"Calendar": cal, "Model": winner_num}).loc[window].dropna()
+            hit = (both["Calendar"] == both["Model"]).mean()
+            p_cal = both["Calendar"].value_counts(normalize=True)
+            p_mod = both["Model"].value_counts(normalize=True)
+            chance = sum(p_cal.get(q, 0) * p_mod.get(q, 0) for q in (1, 2, 3, 4))
+            shifts = range(-120, 121, 5)
+            agree = pd.Series({k: (winner_num == cal.shift(-k))[winner_num.notna()
+                                                                & cal.shift(-k).notna()].mean()
+                               for k in shifts})
+            best_k = int(agree.idxmax())
+            a1, a2, a3 = st.columns(3)
+            a1.metric("Days it matched the calendar", f"{hit:.0%}")
+            a2.metric("Matching by pure chance", f"{chance:.0%}")
+            when = (f"{abs(best_k)} days ahead" if best_k > 0 else
+                    f"{abs(best_k)} days behind" if best_k < 0 else "Same day")
+            a3.metric("Best match when shifted", when)
+            how = (f"the quad {abs(best_k)} trading days later, so it tends to call quads early"
+                   if best_k > 0 else
+                   f"the quad {abs(best_k)} trading days earlier, so it tends to call quads late"
+                   if best_k < 0 else "the same day's quad")
+            st.caption(f"The model's calls line up best with {how} ({agree.max():.0%} of days "
+                       "matched). The calendar is the macro quad from ETF_Bucketing.xlsm, based "
+                       "on growth and inflation data that only comes out weeks later.")
+            names = {i + 1: f"{i + 1} {r}" for i, r in enumerate(REGIMES)}
+            conf = pd.crosstab(both["Calendar"].map(names), both["Model"].map(names),
+                               normalize="index").reindex(index=names.values(),
+                                                          columns=names.values()).fillna(0)
+            conf = conf.map(lambda x: f"{x:.0%}").rename_axis("Real quad \\ Model said")
+            l, r_ = st.columns(2)
+            with l:
+                st.write("**When the real quad was … the model said …** (each row adds to 100%)")
+                st.dataframe(conf.reset_index(), hide_index=True, width="stretch")
+            with r_:
+                by_year = (both["Calendar"] == both["Model"]).groupby(both.index.year).mean()
+                fig_y = go.Figure(go.Bar(x=by_year.index.astype(str), y=by_year.values,
+                                         marker_color="#2a7de1"))
+                fig_y.add_hline(y=chance, line_dash="dash", line_color="gray",
+                                annotation_text="chance")
+                fig_y.update_layout(height=260, title="Match rate by year",
+                                    yaxis_tickformat=".0%", margin=dict(t=40))
+                st.plotly_chart(fig_y, width="stretch")
+
+            # ---- Robustness -----------------------------------------------------------
+            st.subheader("3. Is it robust, or just luck?")
+            bh = rets[f"Buy & hold {bt_asset}"]
+            bh_stats = perf(bh, cash_w)
+            st.write(f"Buy & hold {bt_asset} for comparison: "
+                     f"**{bh_stats['Per year (CAGR)']:+.1%} per year, Sharpe "
+                     f"{bh_stats['Sharpe']:.2f}**.")
+
+            # Settings grid
+            smooths, delays = [5, 10, 15, 19, 25, 30, 40], [1, 2, 3, 5]
+            grid_start = prices.index[min(prices.index.get_loc(first) + 40,
+                                          len(prices.index) - 1)]
+            g_cagr, g_sharpe = {}, {}
+            for sd in smooths:
+                w_sd, _ = winner_from(raw, sd)
+                on = w_sd.isin(nums).astype(float).where(w_sd.notna())
+                for d in delays:
+                    rr = hold(on, asset_ret, cash_ret, d, cost).loc[grid_start:].fillna(0)
+                    st_ = perf(rr, cash_w)
+                    g_cagr.setdefault(f"{d}-day delay", {})[f"{sd} days"] = st_["Per year (CAGR)"]
+                    g_sharpe.setdefault(f"{d}-day delay", {})[f"{sd} days"] = st_["Sharpe"]
+            gl, gr = st.columns(2)
+            with gl:
+                st.write(f"**Regime strategy, return per year** by smoothing (rows) and trade delay")
+                st.dataframe(pd.DataFrame(g_cagr).map(lambda x: f"{x:+.1%}")
+                             .rename_axis("Smoothing").reset_index(), hide_index=True,
+                             width="stretch")
+            with gr:
+                st.write("**Regime strategy, Sharpe** by smoothing (rows) and trade delay")
+                st.dataframe(pd.DataFrame(g_sharpe).map(lambda x: f"{x:.2f}")
+                             .rename_axis("Smoothing").reset_index(), hide_index=True,
+                             width="stretch")
+            st.caption("If only one or two cells beat buy & hold, the result is fragile. A real "
+                       "edge should hold up across most settings.")
+
+            # Every regime combination
+            combos = {}
+            for k in range(1, 5):
+                for combo in itertools.combinations(REGIMES, k):
+                    cn = [REGIMES.index(r) + 1 for r in combo]
+                    on = winner_num.isin(cn).astype(float).where(winner_num.notna())
+                    rr = hold(on, asset_ret, cash_ret, delay, cost).loc[window].fillna(0)
+                    combos[" + ".join(combo)] = perf(rr, cash_w, on)
+            combo_df = fmt_perf(combos).rename(columns={"Strategy": "Invested during"})
+            combo_df["_s"] = [combos[c]["Sharpe"] for c in combo_df["Invested during"]]
+            combo_df = combo_df.sort_values("_s", ascending=False).drop(columns="_s")
+            st.write("**Every combination of regimes to be invested in** (sorted by Sharpe)")
+            st.dataframe(combo_df[["Invested during", "Per year (CAGR)", "Sharpe", "Worst drop",
+                                   "Time invested", "Trades per year"]],
+                         hide_index=True, width="stretch")
+            st.caption("Trying 15 versions and keeping the best is how backtests fool people. "
+                       "The best row here is probably luckier than it will be in the future.")
+
+            # Year by year
+            yearly = (1 + rets).groupby(rets.index.year).prod() - 1
+            st.write("**Year by year**")
+            st.dataframe(yearly.map(lambda x: f"{x:+.1%}").rename_axis("Year").reset_index()
+                         .astype({"Year": str}), hide_index=True, width="stretch")
+
+            # Luck test
+            held_rf = regime_on.shift(delay).loc[window].fillna(0)
+            a_w, c_w = asset_ret.loc[window], cash_ret.loc[window]
+
+            def rf_sharpe(h):
+                r_ = h * a_w + (1 - h) * c_w - h.diff().abs().fillna(0) * cost
+                return sharpe_of(r_, c_w)
+
+            br_w = bucket_ret.loc[window].to_numpy()
+            held_bk = winner_num.shift(delay).loc[window].ffill().bfill()
+
+            def bk_sharpe(h):
+                r_ = br_w[np.arange(len(h)), h.to_numpy().astype(int) - 1]
+                r_ = pd.Series(r_, index=h.index).fillna(c_w)
+                sw = (h != h.shift()).astype(float)
+                sw.iloc[0] = 0
+                return sharpe_of(r_ - sw * 2 * cost, c_w)
+
+            real1, sims1, p1 = luck_test(rf_sharpe, held_rf)
+            real2, sims2, p2 = luck_test(bk_sharpe, held_bk)
+            st.write("**Luck test:** the same strategy with its timing shifted to 1,000 random "
+                     "dates (same amount of time in and out, just at the wrong times). Real "
+                     "skill should beat at least 95% of them.")
+            lt = pd.DataFrame({
+                "Strategy": [label_rf, "Winning bucket's stocks"],
+                "Real Sharpe": [f"{real1:.2f}", f"{real2:.2f}"],
+                "Average random Sharpe": [f"{np.nanmean(sims1):.2f}", f"{np.nanmean(sims2):.2f}"],
+                "Random versions that did as well": [f"{p1:.0%}", f"{p2:.0%}"],
+                "Verdict": ["Likely skill" if p1 <= 0.05 else "Could be luck",
+                            "Likely skill" if p2 <= 0.05 else "Could be luck"]})
+            st.dataframe(lt, hide_index=True, width="stretch")
+
+            st.warning(
+                "**Read before trusting any of this.** (1) The 20 stocks were picked with "
+                "getETF using data through 2026, which includes these same years, so the bucket "
+                "strategies get a head start they wouldn't have had in real time. (2) The quad "
+                "calendar is known with hindsight. (3) This is one stretch of history with many "
+                "versions tested, so the best numbers are likely too good. (4) Costs, taxes and "
+                "slippage are rough guesses. Research only, not financial advice.")
+            out = rets.copy()
+            out.columns = [f"{c} daily return" for c in out.columns]
+            out["Regime Winner"] = winner_num.loc[window]
+            st.download_button("Download backtest CSV", out.to_csv(index_label="Date"),
+                               "backtest.csv", "text/csv")
 
 # ==================================================================================
 # Tab 2: warning signals

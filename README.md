@@ -34,6 +34,7 @@ This project estimates which economic regime the market is pricing in, from the 
 10. **Download the data (optional).** Click **Download CSV** at the bottom for every date's votes, scores and Regime Winner. Open **All data** to browse it on the page.
 11. **Check the Warning signals tab.** Click **Warning signals** at the top of the page to see market indicators that may move before stocks do (details below).
 12. **Add your own tickers.** Click **Add tickers**, type one or more symbols, and click **Rank tickers**. The site ranks each one the same way the getETF macro does and puts it in the bucket where it ranks first (details below).
+13. **Backtest it.** Click **Backtest** to see whether the model picks the right quad and whether trading on it would have beaten just holding (details below).
 
 ---
 
@@ -44,6 +45,36 @@ This project estimates which economic regime the market is pricing in, from the 
 3. Choose which tickers to keep and click **Add … ticker(s) to the model**. Each one goes into its best bucket, and it's removed from any other bucket it was in.
 
 Your buckets are saved in the page link, so they stay when you reload. Bookmark or share that link to keep them. To remove a ticker, delete it from its box in the sidebar. **Reset buckets to defaults** in the sidebar undoes all changes.
+
+---
+
+## Backtest tab
+
+Checks whether the model works, using only information that was available at the time: a signal at one day's close is traded at the close one or more days later (**Trade delay**), and every strategy is tested over the same dates.
+
+**1. Strategy results.** Compared over the same period:
+
+| Strategy | What it does |
+|---|---|
+| Buy & hold | Hold the asset you pick (QQQ by default, or type any ticker) the whole time |
+| Regime strategy | Hold the asset only while the Regime Winner is one of the regimes you pick (Disinflation + Reflation by default); cash otherwise |
+| Opposite of regime strategy | Hold it during the other regimes |
+| Cash at N+ warnings | Go to cash when N or more warning signals are flashing |
+| Winning bucket's stocks | Hold the 5 stocks of whichever regime is winning, at equal weight |
+| Losing bucket's stocks | Hold the 5 stocks of the lowest-scoring regime |
+| All bucket stocks | Hold all 20 stocks at equal weight, the fair comparison for the two bucket strategies |
+
+Each one shows total return, return per year, volatility, Sharpe ratio (return above cash per unit of risk), worst drop, time invested and trades per year, plus charts of growth and drawdowns. Cash earns the 3-month T-bill rate unless you turn that off, and every trade pays the cost you set.
+
+**2. Does it pick the right quad?** How often the Regime Winner matches the macro quad calendar from `ETF_Bucketing.xlsm`, compared with pure chance, broken down by quad and by year, and whether the model's calls tend to come before or after the calendar.
+
+**3. Is it robust, or just luck?**
+- The regime strategy with every combination of smoothing (5 to 40 days) and trade delay (1 to 5 days). A real edge holds up across most of them.
+- Every combination of regimes to be invested in (15 of them), sorted by Sharpe.
+- Year-by-year returns.
+- A luck test: the strategy's timing shifted to 1,000 random dates. Real skill should beat at least 95% of the random versions.
+
+**Read before trusting it:** the 20 stocks were chosen with getETF using data through 2026, which includes the backtest years, so the bucket strategies have a head start they wouldn't have had in real time. The quad calendar is known with hindsight, and testing many versions makes the best one look better than it will be. **Download backtest CSV** saves every strategy's daily returns.
 
 ---
 

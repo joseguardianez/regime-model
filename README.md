@@ -35,6 +35,7 @@ This project estimates which economic regime the market is pricing in, from the 
 11. **Check the Warning signals tab.** Click **Warning signals** at the top of the page to see market indicators that may move before stocks do (details below).
 12. **Add your own tickers.** Click **Add tickers**, type one or more symbols, and click **Rank tickers**. The site ranks each one the same way the getETF macro does and puts it in the bucket where it ranks first (details below).
 13. **Backtest it.** Click **Backtest** to see whether the model picks the right quad and whether trading on it would have beaten just holding (details below).
+14. **Explore the Lab.** Click **Lab** for options expiration dates, dealer gamma, a quad from real GDP and CPI data, and an optimizer that tests 120+ improved versions of the model (details below).
 
 ---
 
@@ -75,6 +76,29 @@ Each one shows total return, return per year, volatility, Sharpe ratio (return a
 - A luck test: the strategy's timing shifted to 1,000 random dates. Real skill should beat at least 95% of the random versions.
 
 **Read before trusting it:** the 20 stocks were chosen with getETF using data through 2026, which includes the backtest years, so the bucket strategies have a head start they wouldn't have had in real time. The quad calendar is known with hindsight, and testing many versions makes the best one look better than it will be. **Download backtest CSV** saves every strategy's daily returns.
+
+---
+
+## Lab tab
+
+Research aimed at making the model better. The code is in `lab.py`.
+
+**1. Options expirations.** The next expiration dates and how QQQ has behaved around them since 2005:
+- Monthly stock and index options expire on the third Friday, or the business day before if that Friday is a market holiday.
+- Quad witching is the March, June, September and December expiration.
+- VIX options and futures expire on the Wednesday 30 days before the third Friday of the next month. If that Wednesday or that Friday is a holiday, they expire the business day before the Wednesday.
+
+**2. Dealer gamma (GEX) and DIX.** Daily data from [SqueezeMetrics](https://squeezemetrics.com/monitor/dix) since May 2011. GEX estimates how much options dealers have to buy or sell when the S&P 500 moves 1%. When it's positive, dealers trade against moves, which tends to calm the market. When it's negative, they trade with moves, which tends to make swings bigger. DIX is the share of dark-pool volume that is buying. The tab shows today's levels and what QQQ did over the next 20 trading days at each gamma level.
+
+**3. The quad from real economic data.** Real GDP (FRED series `GDPC1`) and CPI (`CPIAUCSL`): growth or inflation is "speeding up" when its year-over-year rate is higher than the previous reading. Each figure only counts from roughly when it was published (GDP about a month after the quarter ends, CPI about two weeks after the month ends). The tab compares this quad with the ETF_Bucketing calendar and with your stock model.
+
+**4. Optimizer.** Click **Run the optimizer** (about a minute the first time). It tests version 2 of the model:
+- **Bucket sources:** your 20 stocks; sector ETFs (Disinflation: XLK, XLY, SMH, IWF; Reflation: XLE, XLB, XLI, XLF; Stagflation: GLD, XLU, TIP, DBC; Deflation: TLT, XLP, XLV, UUP); or **walk-forward picks**, where every January getETF re-ranks your stocks and the ETFs using only the previous 5 years and keeps the 5 names that fit each quad best.
+- **Scoring:** the original BUY/SELL votes; **relative strength** (each bucket's 10, 20, 40 or 60-day return minus the average of all four buckets); or the GDP/CPI quad.
+- **Smoothing** of 1, 5, 10 or 20 days, holding the top 1 or top 2 buckets.
+- **Extra filters:** half invested when gamma was negative; half invested the week after monthly expiration; half invested when the GDP/CPI quad isn't one of the buckets held; fully invested when VIX is above VIX3M.
+
+The best version is chosen using **2010-2018 only** and then graded on **2019 onward**, years it never saw. The tab shows that version against buy & hold QQQ and SPY and holding all 4 buckets equally, all 120+ versions with their before and after results, how well the 2010-2018 ranking predicted the 2019+ ranking, a luck test, this year's walk-forward buckets, and **today's pick**: which buckets and tickers the optimized model holds now and how much is invested.
 
 ---
 
@@ -151,6 +175,7 @@ These results come from the spreadsheet version, Oct 12, 2018 – Nov 6, 2026.
 | File | What it is |
 |---|---|
 | `streamlit_app.py` | The website. Streamlit runs this file. |
+| `lab.py` | The Lab tab's research: expiration calendar, gamma, GDP/CPI quad, version 2 of the model and the optimizer. |
 | `regime_model.py` | The same model as a script for Colab or your computer. It saves a CSV and charts and prints the lag test. |
 | `colab_quickstart.ipynb` | A Google Colab notebook that downloads `regime_model.py` from this repo and runs it. |
 | `requirements.txt` | Python packages the website installs. |

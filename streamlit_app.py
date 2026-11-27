@@ -22,6 +22,8 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+import lab
+
 # ----------------------------------------------------------------------------------
 # Default settings: edit these here (or change them in the sidebar while the app runs)
 # ----------------------------------------------------------------------------------
@@ -343,6 +345,71 @@ def luck_test(ret_fn, series, n=1000, seed=0):
     return real, sims, float((sims >= real).mean())
 
 # ----------------------------------------------------------------------------------
+# Lab: expirations, gamma, macro quad, model v2 and the optimizer (research in lab.py)
+# ----------------------------------------------------------------------------------
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_gex():
+    return lab.fetch_gex()
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_macro_inputs():
+    return lab.fetch_fred("GDPC1"), lab.fetch_fred("CPIAUCSL")
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner="Downloading prices since 2005 for the Lab...")
+def load_lab_prices(tickers):
+    data = yf.download(list(tickers) + ["^VIX", "^VIX3M", "^IRX"], start="2005-01-01",
+                       auto_adjust=False, progress=False)
+    return data["Adj Close"]
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner="Running the optimizer: about a minute the first "
+                                              "time, instant after that...")
+def run_lab(own_items):
+    """Everything the optimizer needs, from 2005 on, then lab.run_optimizer."""
+    own = {r: list(t) for r, t in own_items}
+    tickers = sorted(set(t for v in own.values() for t in v) |
+                     set(t for v in lab.ETF_BUCKETS.values() for t in v) | set(lab.BENCHMARKS))
+    px = load_lab_prices(tuple(tickers))
+    prices = px[[t for t in tickers if t in px and px[t].notna().any()]].dropna(how="all")
+    vix = px["^VIX"].reindex(prices.index).ffill()
+    votes = pd.DataFrame({t: stock_vote(prices[t], vix) for t in prices})
+    quad = quad_for_dates(prices.index)
+    cash = (yield_pct(px["^IRX"]).reindex(prices.index).ffill() / 100 / 252).fillna(0)
+    cal = lab.expiration_calendar(2005, prices.index[-1].year + 1)
+    extras = {"week_after": lab.expiration_flags(prices.index, cal)["week_after"],
+              "vix_ratio": vix / px["^VIX3M"].reindex(prices.index).ffill()}
+    notes = []
+    try:
+        extras["gex"] = load_gex()["gex"]
+    except Exception:
+        notes.append("gamma (SqueezeMetrics didn't respond)")
+    try:
+        gdp, cpi = load_macro_inputs()
+        extras["macro"], _ = lab.macro_quads(gdp, cpi, prices.index)
+    except Exception:
+        notes.append("the GDP/CPI quad (FRED didn't respond)")
+    result = lab.run_optimizer(prices, votes, quad, own, cash, extras)
+    result["missing"] = notes
+    return result
+
+
+def pct_cols(df, cols, plus=True):
+    """Format chosen columns as percents for display."""
+    out = df.copy()
+    for c in cols:
+        out[c] = out[c].map(lambda x: "" if pd.isna(x) else (f"{x:+.1%}" if plus else f"{x:.0%}"))
+    return out
+
+
+def num_cols(df, cols, digits=2):
+    out = df.copy()
+    for c in cols:
+        out[c] = out[c].map(lambda x: "" if pd.isna(x) else f"{x:.{digits}f}")
+    return out
+
+# ----------------------------------------------------------------------------------
 # Adding tickers: getETF-style ranking, saved buckets
 # ----------------------------------------------------------------------------------
 def yahoo_url(ticker):
@@ -546,8 +613,8 @@ def compare_box(label, key):
     st.caption(f"[Open {t} on Yahoo Finance ↗]({yahoo_url(t)})")
     return t, px
 
-tab_model, tab_signals, tab_add, tab_bt = st.tabs(
-    ["Regime model", "Warning signals", "Add tickers", "Backtest"])
+tab_model, tab_signals, tab_add, tab_bt, tab_lab = st.tabs(
+    ["Regime model", "Warning signals", "Add tickers", "Backtest", "Lab"])
 
 # ==================================================================================
 # Tab 1: the regime model
@@ -916,6 +983,221 @@ with tab_bt:
             out["Regime Winner"] = winner_num.loc[window]
             st.download_button("Download backtest CSV", out.to_csv(index_label="Date"),
                                "backtest.csv", "text/csv")
+
+# ==================================================================================
+# Tab 5: Lab (written before tab 2's code so tab 2 can stop early safely)
+# ==================================================================================
+with tab_lab:
+    st.markdown(
+        "Extra research to make the model better: options **expiration dates**, dealer "
+        "**gamma**, a **GDP/CPI quad** from real economic data, and an **optimizer** that "
+        "tries 120+ versions of the model (relative strength, sector ETFs, buckets re-picked "
+        "every year) and the extra filters. It picks the best version using **2010-2018 only**, "
+        "then grades it on **2019 onward**, years it never saw.")
+    qqq_long = load_asset("QQQ", "2005-01-01")
+    now = pd.Timestamp.today().normalize()
+    exp_cal = lab.expiration_calendar(2005, now.year + 1)
+
+    # ---- 1. Expirations ----------------------------------------------------------------
+    st.subheader("1. Options expirations")
+    upcoming = exp_cal[exp_cal["Date"] >= now].head(8).copy()
+    upcoming["Days away"] = (upcoming["Date"] - now).dt.days
+    upcoming["Date"] = upcoming["Date"].dt.strftime("%a %b %d, %Y")
+    e1, e2 = st.columns([2, 3])
+    with e1:
+        st.write("**Coming up**")
+        st.dataframe(upcoming, hide_index=True, width="stretch")
+        st.caption("Monthly stock and index options expire on the third Friday (the day before "
+                   "if it's a holiday). Quad witching is the March, June, September and December "
+                   "one. VIX options and futures expire on a Wednesday, 30 days before the next "
+                   "month's third Friday. Holidays here follow the usual NYSE schedule.")
+    if len(qqq_long.dropna()) > 300:
+        effects, by_off = lab.expiration_effects(qqq_long.pct_change(), exp_cal)
+        with e2:
+            st.write(f"**What QQQ did around expirations** "
+                     f"({qqq_long.index[0]:%Y}-{qqq_long.index[-1]:%Y})")
+            show = pct_cols(effects, ["Avg daily return"])
+            show = pct_cols(show, ["% of days up", "Volatility (yearly)"], plus=False)
+            show["Avg daily return"] = effects["Avg daily return"].map(lambda x: f"{x:+.3%}")
+            st.dataframe(show, hide_index=True, width="stretch")
+        fig_ox = go.Figure(go.Bar(x=by_off.index.astype(int), y=by_off.values,
+                                  marker_color=["#d62728" if v < 0 else "#2a7de1"
+                                                for v in by_off.values]))
+        fig_ox.update_layout(height=260, margin=dict(t=40), yaxis_tickformat=".2%",
+                             title="QQQ average daily return by trading day around monthly "
+                                   "expiration (0 = expiration day)",
+                             xaxis_title="Trading days from expiration")
+        st.plotly_chart(fig_ox, width="stretch")
+
+    # ---- 2. Gamma ------------------------------------------------------------------------
+    st.subheader("2. Dealer gamma (GEX) and dark-pool buying (DIX)")
+    try:
+        gx = load_gex()
+        latest = gx.iloc[-1]
+        g1, g2, g3 = st.columns(3)
+        g1.metric(f"GEX on {gx.index[-1]:%b %d}", f"${latest['gex'] / 1e9:.2f} bn",
+                  f"{(latest['gex'] - gx['gex'].iloc[-6]) / 1e9:+.2f} bn vs 1 wk ago")
+        g2.metric("Gamma is", "Positive (calmer)" if latest["gex"] >= 0 else
+                  "Negative (bigger swings)")
+        g3.metric("DIX", f"{latest['dix']:.1%}",
+                  f"{(latest['dix'] - gx['dix'].iloc[-6]) * 100:+.1f} pts vs 1 wk ago")
+        st.caption("GEX estimates how much options dealers must buy or sell when the S&P 500 "
+                   "moves 1%. Positive: dealers trade against the move, which tends to calm the "
+                   "market. Negative: they trade with it, which tends to make swings bigger. DIX "
+                   "is the share of dark-pool volume that is buying. Data: SqueezeMetrics, "
+                   "since May 2011.")
+        fig_gx = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_gx.add_trace(go.Bar(x=gx.index, y=gx["gex"] / 1e9, name="GEX ($bn)",
+                                marker_color=np.where(gx["gex"] < 0, "#d62728", "#2a7de1")),
+                         secondary_y=False)
+        fig_gx.add_trace(go.Scatter(x=gx.index, y=gx["price"], name="S&P 500",
+                                    line=dict(color="black", width=1.5)), secondary_y=True)
+        fig_gx.update_layout(height=360, hovermode="x unified", margin=dict(t=30),
+                             legend=dict(orientation="h", y=1.1),
+                             xaxis=dict(rangeslider=dict(visible=True)))
+        fig_gx.update_yaxes(title_text="GEX ($bn)", secondary_y=False)
+        fig_gx.update_yaxes(title_text="S&P 500", secondary_y=True)
+        st.plotly_chart(fig_gx, width="stretch")
+        gt = lab.gex_table(gx["gex"], qqq_long)
+        if len(gt):
+            cols_ret = [c for c in gt.columns if "return" in c]
+            cols_pct = [c for c in gt.columns if c.startswith("%") or "Volatility" in c]
+            st.write("**What QQQ did over the next 20 trading days, by gamma level**")
+            st.dataframe(pct_cols(pct_cols(gt, cols_ret), cols_pct, plus=False),
+                         hide_index=True, width="stretch")
+    except Exception:
+        st.info("Couldn't reach SqueezeMetrics for gamma data right now. Try again later.")
+
+    # ---- 3. Macro quad --------------------------------------------------------------------
+    st.subheader("3. The quad from real economic data (GDP and CPI)")
+    try:
+        gdp, cpi = load_macro_inputs()
+        lab_index = qqq_long.dropna().index
+        mq, mdetail = lab.macro_quads(gdp, cpi, lab_index)
+        last_q = mdetail.dropna(subset=["Macro quad"]).iloc[-1]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("GDP/CPI quad today", f"{int(last_q['Macro quad'])} "
+                  f"{REGIMES[int(last_q['Macro quad']) - 1]}")
+        m2.metric("Real GDP growth (YoY)", f"{last_q['GDP growth (YoY)']:.1%}",
+                  "speeding up" if last_q["Growth speeding up"] == 1 else "slowing",
+                  delta_color="normal" if last_q["Growth speeding up"] == 1 else "inverse")
+        m3.metric("CPI inflation (YoY)", f"{last_q['CPI inflation (YoY)']:.1%}",
+                  "speeding up" if last_q["Inflation speeding up"] == 1 else "slowing",
+                  delta_color="inverse" if last_q["Inflation speeding up"] == 1 else "normal")
+        cal_q = quad_for_dates(lab_index)
+        both_c = pd.DataFrame({"m": mq, "c": cal_q}).dropna()
+        both_m = pd.DataFrame({"m": mq, "w": winner_num}).dropna()
+        st.caption(
+            f"Growth or inflation 'speeding up' means its year-over-year rate is higher than "
+            f"the last reading. Each number counts only from the day it was published (GDP about "
+            f"a month after the quarter, CPI about two weeks after the month), using today's "
+            f"revised figures. This quad matched the ETF_Bucketing calendar on "
+            f"{(both_c['m'] == both_c['c']).mean():.0%} of days and your stock model's Regime "
+            f"Winner on {(both_m['m'] == both_m['w']).mean():.0%} of days.")
+        fig_mq = go.Figure()
+        fig_mq.add_trace(go.Scatter(x=mq.index, y=mq, name="GDP/CPI quad", line_shape="hv",
+                                    line=dict(color="#2a7de1", width=1.5)))
+        fig_mq.add_trace(go.Scatter(x=cal_q.index, y=cal_q, name="ETF_Bucketing calendar",
+                                    line_shape="hv", line=dict(color="gray", width=1, dash="dot")))
+        fig_mq.update_layout(height=240, margin=dict(t=20), legend=dict(orientation="h", y=1.15),
+                             yaxis=dict(tickvals=[1, 2, 3, 4],
+                                        ticktext=[f"{i + 1} {r}" for i, r in enumerate(REGIMES)]))
+        st.plotly_chart(fig_mq, width="stretch")
+    except Exception:
+        st.info("Couldn't reach FRED for GDP and CPI data right now. Try again later.")
+
+    # ---- 4. Optimizer ---------------------------------------------------------------------
+    st.subheader("4. Optimizer")
+    st.markdown(
+        "**Version 2 of the model**, tested every way:\n"
+        "- **Bucket sources:** your 20 stocks, sector ETFs (XLK, XLE, GLD, TLT and so on), or "
+        "**walk-forward picks**: every January, getETF re-ranks your stocks and the ETFs using "
+        "only the previous 5 years and keeps the 5 names that fit each quad best.\n"
+        "- **Scoring:** the original BUY/SELL votes, **relative strength** (each bucket's return "
+        "over 10, 20, 40 or 60 days minus the average of all four), or the GDP/CPI quad.\n"
+        "- **Smoothing** of 1, 5, 10 or 20 days, holding the **top 1 or top 2** buckets.\n"
+        "- **Extra filters:** " + "; ".join(f"*{k}*: {v.lower()}" for k, v in
+                                           lab.OVERLAYS.items()) + ".\n\n"
+        "Trades happen the day after each signal and pay 5 basis points; cash earns the T-bill "
+        "rate. The bucket sources include your current 20 stocks, so that row has a hindsight "
+        "head start; the ETF and walk-forward versions don't.")
+    if st.button("Run the optimizer", type="primary") or st.session_state.get("lab_ran"):
+        st.session_state["lab_ran"] = True
+        res = run_lab(tuple((r, tuple(buckets[r])) for r in REGIMES))
+        if res["missing"]:
+            st.warning("Ran without " + " and ".join(res["missing"]) + ".")
+        td = res["today"]
+        names = "; ".join(
+            f"**{r}**: " + ", ".join(f"[{t}]({yahoo_url(t)})" for t in td["names"][r])
+            for r in td["buckets"])
+        st.success(f"**Today's pick** (signal from {td['date']:%b %d, %Y}): {names}. "
+                   f"Invested: **{td['exposure']:.0%}** (the rest in cash).  \n"
+                   f"Setup: {td['setup']}")
+
+        st.write("**The winner vs the benchmarks.** 2010-2018 is where it was picked; 2019+ "
+                 "is the real test.")
+        summ = res["summary"]
+        summ = pct_cols(summ, ["2010-2018 per year", "2019+ per year", "2019+ worst drop"])
+        summ = num_cols(summ, ["2010-2018 Sharpe", "2019+ Sharpe"])
+        st.dataframe(summ, hide_index=True, width="stretch")
+        growth = 10000 * (1 + res["curves"].fillna(0)).cumprod()
+        fig_o = go.Figure([go.Scatter(x=growth.index, y=growth[c], name=c,
+                                      line=dict(width=2.2 if i == 0 else 1.3))
+                           for i, c in enumerate(growth)])
+        fig_o.add_vrect(x0=pd.Timestamp(res["test_start"]), x1=growth.index[-1], fillcolor="#2ca02c",
+                        opacity=0.07, line_width=0, annotation_text="Unseen test years",
+                        annotation_position="top left")
+        fig_o.update_layout(height=420, yaxis_type="log", hovermode="x unified",
+                            title="Growth of $10,000 (log scale)", margin=dict(t=40),
+                            legend=dict(orientation="h", y=-0.15))
+        st.plotly_chart(fig_o, width="stretch")
+
+        lk = res["luck"]
+        st.write(f"**Luck test (2019+):** real Sharpe **{lk['real']:.2f}** vs "
+                 f"{lk['avg_random']:.2f} on average when the same picks are moved to random "
+                 f"dates; **{lk['share_as_good']:.0%}** of random versions did as well. "
+                 + ("That's under 5%, so it looks like skill." if lk["share_as_good"] <= 0.05
+                    else "That's over 5%, so luck can't be ruled out."))
+
+        core = res["core"]
+        st.write(f"**All {len(core)} versions, best on 2010-2018 first.** Does doing well "
+                 f"before 2019 predict doing well after? Rank correlation: "
+                 f"**{res['rho']:.2f}** (1 = perfectly, 0 = not at all, negative = the "
+                 f"opposite).")
+        core_show = core[["Setup", "Train Sharpe", "Train per year", "Test Sharpe",
+                          "Test per year", "Test worst drop"]]
+        core_show = num_cols(pct_cols(core_show, ["Train per year", "Test per year",
+                                                  "Test worst drop"]),
+                             ["Train Sharpe", "Test Sharpe"])
+        st.dataframe(core_show, hide_index=True, width="stretch", height=380)
+
+        st.write("**Extra filters added to the best version** (picked on 2010-2018 again)")
+        ov = res["overlays"]
+        ov_show = num_cols(pct_cols(pct_cols(ov, ["Train per year", "Test per year",
+                                                  "Test worst drop"]),
+                                    ["Average invested"], plus=False),
+                           ["Train Sharpe", "Test Sharpe"])
+        st.dataframe(ov_show, hide_index=True, width="stretch")
+
+        wf = res["walk_forward"]
+        if wf:
+            yr = max(wf)
+            st.write(f"**Walk-forward buckets for {yr}** (picked using {yr - 5}-{yr - 1} only)")
+            st.dataframe(pd.DataFrame({r: pd.Series(wf[yr][r], dtype=str) for r in REGIMES})
+                         .fillna(""), hide_index=True, width="stretch")
+            with st.expander("Walk-forward buckets for every year"):
+                st.dataframe(pd.DataFrame({y: {r: ", ".join(m[r]) for r in REGIMES}
+                                           for y, m in sorted(wf.items())}).T
+                             .rename_axis("Year").reset_index().astype({"Year": str}),
+                             hide_index=True, width="stretch")
+        st.warning(
+            "**Read before trusting it.** Picking the best of 120+ versions makes the winner "
+            "look better than it is, which is why only the 2019+ numbers count. GDP data is "
+            "today's revised version, not what was known at the time. Gamma data starts in "
+            "May 2011. Research only, not financial advice.")
+    else:
+        st.caption("Takes about a minute the first time (it downloads 20 years of prices for "
+                   "about 40 tickers), then it's saved for 6 hours.")
 
 # ==================================================================================
 # Tab 2: warning signals

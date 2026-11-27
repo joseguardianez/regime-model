@@ -214,6 +214,10 @@ def macro_quads(gdp, cpi, index):
     real GDP year-over-year growth vs the quarter before (released about a month after the
     quarter ends) and CPI year-over-year inflation vs 3 months before (released about two
     weeks after the month ends). Uses today's revised GDP data, not the first release."""
+    # Put both on a regular calendar first, filling single missing readings (FRED has no
+    # October 2025 CPI because of the government shutdown) so "a year ago" is really 12 months
+    gdp = gdp.asfreq("QS").interpolate(limit_area="inside")
+    cpi = cpi.asfreq("MS").interpolate(limit_area="inside")
     g = gdp.pct_change(4, fill_method=None)
     g_up = (g.diff() > 0).where(g.diff().notna())
     g_up.index = g_up.index + pd.DateOffset(months=3) + pd.Timedelta(days=30)
